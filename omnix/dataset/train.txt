@@ -1,1 +1,14 @@
-
+OMNIX is an experimental language model.
+OMNIX learns patterns from text.
+A language model predicts the next token.
+Artificial intelligence is created using algorithms and data.
+Machine learning allows computers to learn patterns.
+Neural networks contain parameters that are adjusted during training.
+Transformers use attention to process sequences.
+OMNIX 1.0 is the beginning of the OMNIX model family.
+OMNIX will become better through future versions.
+Version 1.1 will improve the tokenizer and training pipeline.
+Version 1.2 will improve the dataset pipeline.
+Version 1.3 will introduce instruction tuning.
+Version 1.4 will focus on coding.
+Version 1.5 will focus on Minecraft development.
