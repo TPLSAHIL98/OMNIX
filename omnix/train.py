@@ -1,5 +1,7 @@
 import os
 import math
+import random
+
 import torch
 
 from omnix import OMNIX, OMNIXConfig, ByteTokenizer
@@ -11,14 +13,27 @@ CHECKPOINT_DIR = "checkpoints"
 BATCH_SIZE = 16
 MAX_ITERS = 5000
 LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 0.01
 
 EVAL_INTERVAL = 250
 EVAL_ITERS = 50
 
+TRAIN_SPLIT = 0.9
+
+SEED = 42
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def load_dataset():
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_data():
     if not os.path.exists(DATASET):
         raise FileNotFoundError(
             f"Dataset not found: {DATASET}"
@@ -28,18 +43,28 @@ def load_dataset():
         text = f.read()
 
     tokenizer = ByteTokenizer()
-
     tokens = tokenizer.encode(text)
+
+    if len(tokens) < 1000:
+        print(
+            "WARNING: dataset contains very few tokens. "
+            "OMNIX will train, but the model will be extremely limited."
+        )
 
     data = torch.tensor(tokens, dtype=torch.long)
 
-    return data, tokenizer
+    split = int(len(data) * TRAIN_SPLIT)
+
+    train_data = data[:split]
+    val_data = data[split:]
+
+    return train_data, val_data, tokenizer
 
 
 def get_batch(data, block_size):
     if len(data) <= block_size + 1:
         raise ValueError(
-            "Dataset is too small for the configured block size."
+            "Dataset split is too small for the configured block size."
         )
 
     starts = torch.randint(
@@ -62,28 +87,65 @@ def get_batch(data, block_size):
 
 
 @torch.no_grad()
-def estimate_loss(model, data):
+def estimate_loss(model, train_data, val_data):
     model.eval()
 
-    losses = []
+    results = {}
 
-    for _ in range(EVAL_ITERS):
-        x, y = get_batch(data, model.config.block_size)
-        _, loss = model(x, y)
-        losses.append(loss.item())
+    for name, data in [
+        ("train", train_data),
+        ("val", val_data)
+    ]:
+        losses = []
+
+        for _ in range(EVAL_ITERS):
+            x, y = get_batch(
+                data,
+                model.config.block_size
+            )
+
+            _, loss = model(x, y)
+
+            losses.append(loss.item())
+
+        results[name] = sum(losses) / len(losses)
 
     model.train()
 
-    return sum(losses) / len(losses)
+    return results
+
+
+def save_checkpoint(model, config, optimizer, step, best_val):
+    os.makedirs(
+        CHECKPOINT_DIR,
+        exist_ok=True
+    )
+
+    checkpoint = {
+        "model": model.state_dict(),
+        "config": config.__dict__,
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "best_val": best_val,
+        "version": "1.0.0",
+    }
+
+    torch.save(
+        checkpoint,
+        f"{CHECKPOINT_DIR}/omnix-1.0-latest.pt"
+    )
 
 
 def main():
-    print("================================")
-    print("          OMNIX 1.0")
-    print("================================")
+    set_seed(SEED)
+
+    print("=" * 40)
+    print("             OMNIX 1.0")
+    print("=" * 40)
+
     print(f"Device: {DEVICE}")
 
-    data, tokenizer = load_dataset()
+    train_data, val_data, tokenizer = load_data()
 
     config = OMNIXConfig(
         vocab_size=tokenizer.vocab_size
@@ -91,47 +153,76 @@ def main():
 
     model = OMNIX(config).to(DEVICE)
 
-    parameters = sum(
+    parameter_count = sum(
         p.numel()
         for p in model.parameters()
     )
 
-    print(f"Parameters: {parameters:,}")
-    print(f"Training tokens: {len(data):,}")
+    print(f"Parameters: {parameter_count:,}")
+    print(f"Training tokens: {len(train_data):,}")
+    print(f"Validation tokens: {len(val_data):,}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LEARNING_RATE
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
     )
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=MAX_ITERS
+    )
 
-    for iteration in range(MAX_ITERS):
+    best_val = float("inf")
 
-        if iteration % EVAL_INTERVAL == 0:
-            loss = estimate_loss(model, data)
+    for step in range(MAX_ITERS):
+
+        if step % EVAL_INTERVAL == 0:
+            losses = estimate_loss(
+                model,
+                train_data,
+                val_data
+            )
+
+            train_loss = losses["train"]
+            val_loss = losses["val"]
 
             perplexity = math.exp(
-                min(loss, 20)
+                min(val_loss, 20)
             )
 
             print(
-                f"step {iteration:5d} | "
-                f"loss {loss:.4f} | "
+                f"step {step:5d} | "
+                f"train {train_loss:.4f} | "
+                f"val {val_loss:.4f} | "
                 f"ppl {perplexity:.2f}"
             )
 
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "config": config.__dict__,
-                    "step": iteration,
-                },
-                f"{CHECKPOINT_DIR}/omnix-1.0-step-{iteration}.pt"
+            save_checkpoint(
+                model,
+                config,
+                optimizer,
+                step,
+                best_val
             )
 
+            if val_loss < best_val:
+                best_val = val_loss
+
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "config": config.__dict__,
+                        "optimizer": optimizer.state_dict(),
+                        "step": step,
+                        "best_val": best_val,
+                        "version": "1.0.0",
+                    },
+                    f"{CHECKPOINT_DIR}/omnix-1.0-best.pt"
+                )
+
         x, y = get_batch(
-            data,
+            train_data,
             config.block_size
         )
 
@@ -147,18 +238,33 @@ def main():
         )
 
         optimizer.step()
+        scheduler.step()
+
+    save_checkpoint(
+        model,
+        config,
+        optimizer,
+        MAX_ITERS,
+        best_val
+    )
 
     torch.save(
         {
             "model": model.state_dict(),
             "config": config.__dict__,
+            "optimizer": optimizer.state_dict(),
             "step": MAX_ITERS,
+            "best_val": best_val,
+            "version": "1.0.0",
         },
         f"{CHECKPOINT_DIR}/omnix-1.0-final.pt"
     )
 
+    print()
     print("Training complete.")
-    print("Saved: checkpoints/omnix-1.0-final.pt")
+    print("Saved:")
+    print("  checkpoints/omnix-1.0-final.pt")
+    print("  checkpoints/omnix-1.0-best.pt")
 
 
 if __name__ == "__main__":
